@@ -1,85 +1,110 @@
 from TeraboxDL import TeraboxDL
 import requests
+import io
+import os
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
-import os
+import time
 
 API_ID = 6067591
 API_HASH = "94e17044c2393f43fda31d3afe77b26b"
-BOT_TOKEN = "7570465536:AAEXqxZ2iIcMni5E5MpCIW_RvmJTvY2HcTI"  # <-- Replace with your bot token
-TERABOX_COOKIE = "lang=en; ndus=YuTgK3HteHuieoUQBhkEn7b08MXArG0Mvy1KJkf4;"  # <-- Replace with your TeraBox cookie
+BOT_TOKEN = "7570465536:AAEXqxZ2iIcMni5E5MpCIW_RvmJTvY2HcTI"
+TERABOX_COOKIE = "lang=en; ndus=YuTgK3HteHuieoUQBhkEn7b08MXArG0Mvy1KJkf4;"  # Replace with your TeraBox cookie
 
-# Setup download path
-DOWNLOAD_PATH = "downloads"
-os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-
-# Setup Pyrogram bot
 app = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# /get command handler
-@app.on_message(filters.command("get") & filters.private)
-async def get_file(client: Client, message: Message):
-    """
-    Usage: /get <terabox_share_link>
-    """
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.reply("❌ Usage: /get <terabox_link>")
-        return
-
-    share_url = parts[1].strip()
-    if "terabox" not in share_url:
-        await message.reply("❌ Invalid TeraBox link")
-        return
-
-    await message.reply("🔍 Processing link, please wait...")
+# Progress Bar (optional — will skip if too fast)
+async def progress_bar(current, total, message: Message, start_time):
+    percent = current * 100 / total
+    speed = current / (time.time() - start_time + 1)
+    eta = int((total - current) / (speed + 1))
+    bar = f"[{'=' * int(percent / 10)}{' ' * (10 - int(percent / 10))}]"
 
     try:
-        # ── FETCH METADATA FROM TERABOX BACKEND ──
+        await message.edit_text(
+            f"📤 Uploading...\n{bar} {percent:.1f}%\n"
+            f"{current // (1024*1024)}MB / {total // (1024*1024)}MB | ETA: {eta}s"
+        )
+    except:
+        pass
+
+@app.on_message(filters.private & filters.text)
+async def handle_link(client: Client, message: Message):
+    link = message.text.strip()
+
+    # Validate link
+    if "terabox" not in link:
+        return
+
+    # Delete original message after process
+    user_msg = message
+    process_msg = await message.reply("🔗 Processing TeraBox link...")
+
+    try:
         terabox = TeraboxDL(TERABOX_COOKIE)
-        info = terabox.get_file_info(share_url)  
-        # Note: we do NOT pass direct_url=True here anymore.
+        info = terabox.get_file_info(link)
 
-        # Depending on TeraboxDL version, the returned keys could be:
-        #   - 'download_url'  (or)
-        #   - 'download_link'
-        #   - 'file_name'     (or)
-        #   - 'file_name'     (or sometimes 'filename')
-        # Let’s pick whichever exists:
         if "error" in info:
-            await message.reply(f"❌ Error: {info['error']}")
+            err = await message.reply(f"❌ Error: {info['error']}")
+            await asyncio.sleep(10)
+            await err.delete()
+            await process_msg.delete()
+            await user_msg.delete()
             return
 
-        # Pull out the actual download URL:
+        # Extract URL and filename
         download_url = info.get("download_url") or info.get("download_link")
+        file_name = info.get("file_name") or info.get("filename") or os.path.basename(download_url.split("?")[0])
+
         if not download_url:
-            await message.reply("❌ Could not find a direct download URL in the TeraboxDL response.")
+            err = await message.reply("❌ Failed to get download URL.")
+            await asyncio.sleep(10)
+            await err.delete()
+            await process_msg.delete()
+            await user_msg.delete()
             return
 
-        # Pull out the filename:
-        file_name = info.get("file_name") or info.get("filename")
-        if not file_name:
-            # As a fallback, derive name from URL
-            file_name = os.path.basename(download_url.split("?")[0])
+        downloading_msg = await message.reply(f"⬇️ Downloading `{file_name}` into memory...")
 
-        # ── PERFORM THE HTTP DOWNLOAD ──
-        local_path = os.path.join(DOWNLOAD_PATH, file_name)
+        # Download file into memory
+        file_stream = io.BytesIO()
+        start = time.time()
         with requests.get(download_url, stream=True) as r:
             r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            for chunk in r.iter_content(chunk_size=1048576):  # 1 MB
+                if chunk:
+                    file_stream.write(chunk)
 
-        # ── SEND THE FILE IN TELEGRAM ──
-        await message.reply_document(local_path, caption=f"✅ Sent: {file_name}")
-        os.remove(local_path)
+        file_stream.name = file_name
+        file_stream.seek(0)
+        file_size = len(file_stream.getvalue())
+        size_mb = file_size / (1024 * 1024)
+
+        # Upload to Telegram with progress
+        uploading_msg = await message.reply(f"📤 Uploading `{file_name}` ({size_mb:.2f} MB)...")
+        start_time = time.time()
+        sent = await message.reply_document(
+            document=file_stream,
+            file_name=file_name,
+            caption=f"✅ `{file_name}` ({size_mb:.2f} MB)",
+            progress=progress_bar,
+            progress_args=(uploading_msg, file_size, start_time)
+        )
+
+        # Clean up all messages
+        await downloading_msg.delete()
+        await uploading_msg.delete()
+        await process_msg.delete()
+        await user_msg.delete()
+        await asyncio.sleep(20)
+        await sent.delete()
 
     except Exception as e:
-        # If something goes wrong (HTTP error, path error, etc.), report it:
-        await message.reply(f"❌ Failed: {e}")
+        err_msg = await message.reply(f"❌ Error: {e}")
+        await asyncio.sleep(10)
+        await err_msg.delete()
+        await process_msg.delete()
+        await user_msg.delete()
 
-# ── STEP 4: RUN YOUR BOT ──
 app.run()
-info = terabox.get_file_info(share_url)
-print(info)  # Send this to your console or logs to inspect the dictionary
